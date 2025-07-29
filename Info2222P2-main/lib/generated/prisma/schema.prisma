@@ -1,0 +1,394 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite" // Using SQLite for development, can be changed to PostgreSQL for production
+  url      = env("DATABASE_URL")
+}
+
+// User model for authentication and user management
+model User {
+  id                     String    @id @default(uuid())
+  username               String    @unique
+  email                  String    @unique
+  hashedPassword         String // Argon2id hashed password (includes salt)
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+  isVerified             Boolean   @default(false)
+  verificationToken      String? // For email verification
+  verificationExpires    DateTime?
+  resetToken             String? // For password reset
+  resetTokenExpires      DateTime?
+  lastLogin              DateTime?
+  twoFactorEnabled       Boolean   @default(false)
+  twoFactorSecret        String? // For 2FA if enabled
+  lastPasswordChange     DateTime? // For password expiry tracking
+  previousPasswordHashes String? // JSON string of previous password hashes
+
+  // User profile
+  displayName String?
+  avatarUrl   String?
+  bio         String?
+
+  // Relations
+  sentMessages     Message[]         @relation("SentMessages")
+  ownedGroups      Group[]           @relation("GroupOwner")
+  memberOfGroups   GroupMember[]
+  sessions         Session[]
+  userSecurityLogs UserSecurityLog[]
+
+  // Discussion and file relations
+  posts           DiscussionPost[] @relation("PostAuthor")
+  comments        Comment[]        @relation("CommentAuthor")
+  reactions       Reaction[]       @relation("ReactionAuthor")
+  uploadedFiles   File[]           @relation("FileUploader")
+  pinnedItems     PinnedItem[]     @relation("PinnedBy")
+  tasks           Task[]           @relation("TaskOwner")
+  taskAssignments TaskAssignment[] @relation("TaskAssignee")
+}
+
+// Session management for secure authentication
+model Session {
+  id         String   @id @default(uuid())
+  userId     String
+  token      String   @unique // JWT or session token
+  deviceInfo String? // Store user agent info
+  ipAddress  String? // Store IP for security tracking
+  createdAt  DateTime @default(now())
+  expiresAt  DateTime
+  isRevoked  Boolean  @default(false)
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// Groups for communication
+model Group {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  ownerId     String
+  isPrivate   Boolean  @default(false)
+  avatarUrl   String?
+
+  // Relations
+  owner    User          @relation("GroupOwner", fields: [ownerId], references: [id])
+  members  GroupMember[]
+  messages Message[]
+
+  // Group content
+  discussionBoards DiscussionBoard[]
+  files            File[]
+  encryptionKeys   EncryptionKey[]
+  pinnedItems      PinnedItem[]
+  tasks            Task[]
+}
+
+// Group membership with permission levels
+model GroupMember {
+  id        String   @id @default(uuid())
+  userId    String
+  groupId   String
+  role      String   @default("MEMBER") // OWNER, ADMIN, MEMBER
+  joinedAt  DateTime @default(now())
+  invitedBy String?
+
+  // Notification preferences
+  notifyOnNewMessage    Boolean @default(true)
+  notifyOnMention       Boolean @default(true)
+  notifyOnNewDiscussion Boolean @default(true)
+
+  // Relations
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, groupId]) // Each user can only be a member of a group once
+}
+
+// Encrypted messages
+model Message {
+  id               String        @id @default(uuid())
+  senderId         String
+  groupId          String
+  encryptedContent String // Encrypted message content
+  iv               String // Initialization vector for encryption
+  keyId            String? // Reference to the encryption key used
+  metaData         String? // JSON string with additional metadata
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  replyToId        String? // For message threads
+  readBy           MessageRead[]
+
+  // For ephemeral messages (disappearing)
+  ephemeralExpiry DateTime?
+  isEphemeral     Boolean   @default(false)
+
+  // Relations
+  sender  User      @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
+  group   Group     @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  replyTo Message?  @relation("MessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies Message[] @relation("MessageReplies")
+
+  // Message attachments
+  attachments File[]     @relation("MessageAttachments")
+  reactions   Reaction[] @relation("MessageReactions")
+}
+
+// Track which users have read messages
+model MessageRead {
+  id        String   @id @default(uuid())
+  messageId String
+  userId    String
+  readAt    DateTime @default(now())
+
+  // Relations
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId]) // Each user can only read a message once
+}
+
+// Security audit log for tracking sensitive actions
+model UserSecurityLog {
+  id        String   @id @default(uuid())
+  userId    String
+  action    String // LOGIN, LOGOUT, PASSWORD_CHANGE, ACCOUNT_CREATION, etc.
+  ipAddress String?
+  userAgent String?
+  timestamp DateTime @default(now())
+  success   Boolean  @default(true)
+  details   String? // Additional details about the action
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// EncryptionKey model for key management and rotation
+model EncryptionKey {
+  id           String   @id @default(cuid())
+  keyType      String // e.g., "AES", "RSA_PUBLIC", "RSA_PRIVATE", etc.
+  keyValue     String // encrypted key material
+  iv           String // initialization vector for key encryption
+  algorithm    String // algorithm identifier (e.g., "AES-256-GCM", "RSA-2048")
+  createdAt    DateTime @default(now())
+  expiresAt    DateTime // when the key expires (for rotation)
+  isRevoked    Boolean  @default(false) // for emergency revocation
+  groupId      String? // optional group association
+  relatedKeyId String? // for related keys (e.g., public/private key pairs)
+
+  // Relations
+  group      Group?          @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  relatedKey EncryptionKey?  @relation("RelatedKeys", fields: [relatedKeyId], references: [id], onDelete: SetNull)
+  relatedTo  EncryptionKey[] @relation("RelatedKeys")
+
+  @@index([keyType, groupId, expiresAt, isRevoked])
+  @@index([relatedKeyId])
+}
+
+// Track security vulnerabilities for demonstration
+model VulnerabilityDemo {
+  id                String   @id @default(uuid())
+  vulnerabilityType String // SQL_INJECTION, XSS, MITM, etc.
+  description       String
+  mitigations       String // How to fix the vulnerability
+  demonstrationCode String? // Sample code showing the vulnerability
+  createdAt         DateTime @default(now())
+}
+
+// Discussion Board for organized topical conversations
+model DiscussionBoard {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  groupId     String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  isArchived  Boolean  @default(false)
+  sortOrder   Int      @default(0) // For custom ordering
+
+  // Relations
+  group Group            @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  posts DiscussionPost[]
+}
+
+// Individual posts within a discussion board
+model DiscussionPost {
+  id               String   @id @default(uuid())
+  title            String
+  encryptedContent String // Encrypted post content
+  iv               String // Initialization vector for encryption
+  keyId            String? // Reference to the encryption key used
+  authorId         String
+  boardId          String
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  isLocked         Boolean  @default(false)
+  isPinned         Boolean  @default(false)
+  viewCount        Int      @default(0)
+
+  // Relations
+  author      User            @relation("PostAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  board       DiscussionBoard @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  comments    Comment[]
+  attachments File[]          @relation("PostAttachments")
+  reactions   Reaction[]      @relation("PostReactions")
+
+  @@index([boardId, createdAt])
+  @@index([authorId])
+}
+
+// Comments on posts, messages, or files
+model Comment {
+  id               String   @id @default(uuid())
+  encryptedContent String // Encrypted comment content
+  iv               String // Initialization vector for encryption
+  keyId            String? // Reference to the encryption key used
+  authorId         String
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  parentId         String? // For nested comments
+
+  // Relations for what this comment is attached to
+  postId String?
+  fileId String?
+
+  // Relations
+  author        User            @relation("CommentAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  post          DiscussionPost? @relation(fields: [postId], references: [id], onDelete: Cascade)
+  file          File?           @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  parentComment Comment?        @relation("CommentReplies", fields: [parentId], references: [id], onDelete: SetNull)
+  replies       Comment[]       @relation("CommentReplies")
+  reactions     Reaction[]      @relation("CommentReactions")
+
+  @@index([authorId])
+  @@index([postId])
+  @@index([fileId])
+}
+
+// User reactions to content (likes, bookmarks, etc.)
+model Reaction {
+  id        String   @id @default(uuid())
+  type      String // LIKE, HEART, BOOKMARK, etc.
+  userId    String
+  createdAt DateTime @default(now())
+
+  // Relations for what this reaction is attached to
+  messageId String?
+  postId    String?
+  commentId String?
+  fileId    String?
+
+  // Relations
+  user    User            @relation("ReactionAuthor", fields: [userId], references: [id], onDelete: Cascade)
+  message Message?        @relation("MessageReactions", fields: [messageId], references: [id], onDelete: Cascade)
+  post    DiscussionPost? @relation("PostReactions", fields: [postId], references: [id], onDelete: Cascade)
+  comment Comment?        @relation("CommentReactions", fields: [commentId], references: [id], onDelete: Cascade)
+  file    File?           @relation("FileReactions", fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, messageId, postId, commentId, fileId, type])
+  @@index([userId])
+  @@index([messageId])
+  @@index([postId])
+  @@index([commentId])
+  @@index([fileId])
+}
+
+// File storage model
+model File {
+  id              String   @id @default(uuid())
+  filename        String
+  originalName    String
+  mimeType        String
+  size            Int
+  path            String // Storage path or URL
+  isEncrypted     Boolean  @default(false)
+  encryptionKeyId String? // If the file is encrypted
+  encryptionIv    String? // IV for decryption
+  checksum        String? // For integrity verification
+  uploaderId      String
+  groupId         String? // null for private files
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  isArchived      Boolean  @default(false)
+  thumbnailPath   String? // Path to thumbnail if applicable
+  metadata        String? // JSON string with additional metadata
+
+  // Relations
+  uploader  User       @relation("FileUploader", fields: [uploaderId], references: [id], onDelete: Cascade)
+  group     Group?     @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  comments  Comment[]
+  reactions Reaction[] @relation("FileReactions")
+
+  // Related content
+  messages Message[]        @relation("MessageAttachments")
+  posts    DiscussionPost[] @relation("PostAttachments")
+
+  @@index([uploaderId])
+  @@index([groupId])
+  @@index([createdAt])
+}
+
+// Pinned items for quick access
+model PinnedItem {
+  id       String   @id @default(uuid())
+  userId   String
+  groupId  String
+  itemType String // MESSAGE, POST, FILE, etc.
+  itemId   String // ID of the pinned item
+  pinnedAt DateTime @default(now())
+  note     String? // Optional note about why it's pinned
+
+  // Relations
+  user  User  @relation("PinnedBy", fields: [userId], references: [id], onDelete: Cascade)
+  group Group @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, itemType, itemId])
+  @@index([groupId])
+}
+
+// Task management model
+model Task {
+  id          String    @id @default(uuid())
+  title       String
+  description String?
+  status      String    @default("TODO") // TODO, IN_PROGRESS, DONE, etc.
+  priority    String    @default("MEDIUM") // LOW, MEDIUM, HIGH, URGENT
+  dueDate     DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  creatorId   String
+  groupId     String
+
+  // Relations
+  creator     User             @relation("TaskOwner", fields: [creatorId], references: [id], onDelete: Cascade)
+  group       Group            @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  assignments TaskAssignment[]
+
+  @@index([groupId])
+  @@index([creatorId])
+  @@index([status])
+  @@index([dueDate])
+}
+
+// Task assignments to users
+model TaskAssignment {
+  id         String   @id @default(uuid())
+  taskId     String
+  userId     String
+  assignedAt DateTime @default(now())
+
+  // Relations
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user User @relation("TaskAssignee", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, userId])
+}
